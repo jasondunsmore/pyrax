@@ -104,9 +104,7 @@ class ScalingGroup(BaseResource):
         return self.manager.get_launch_config(self)
 
 
-    def update_launch_config(self, server_name=None, image=None, flavor=None,
-            disk_config=None, metadata=None, personality=None, networks=None,
-            load_balancers=None, key_name=None, config_drive=False, user_data=None):
+    def update_launch_config(self, launch_config_type, **kwargs):
         """
         Updates the server launch configuration for this scaling group.
         One or more of the available attributes can be specified.
@@ -115,11 +113,36 @@ class ScalingGroup(BaseResource):
         If you want to add to it, you either need to pass the complete dict of
         metadata, or call the update_launch_metadata() method.
         """
-        return self.manager.update_launch_config(self, server_name=server_name,
-                image=image, flavor=flavor, disk_config=disk_config,
-                metadata=metadata, personality=personality, networks=networks,
+        if launch_config_type == 'launch_server':
+            server_name = kwargs.get('server_name')
+            image = kwargs.get('image')
+            flavor = kwargs.get('flavor')
+            disk_config = kwargs.get('disk_config', None)
+            metadata = kwargs.get('metadata', {})
+            personality = kwargs.get('personality')
+            networks = kwargs.get('networks')
+            load_balancers = kwargs.get('load_balancers')
+            key_name = kwargs.get('key_name')
+            config_drive = kwargs.get('config_drive', False)
+            user_data = kwargs.get('user_data')
+            return self.manager.update_launch_config(
+                self, server_name=server_name, image=image, flavor=flavor,
+                disk_config=disk_config, metadata=metadata,
+                personality=personality, networks=networks,
                 load_balancers=load_balancers, key_name=key_name,
                 config_drive=config_drive, user_data=user_data)
+        elif launch_config_type == 'launch_stack':
+            template = kwargs.get('template'),
+            template_url = kwargs.get('template_url'),
+            disable_rollback = kwargs.get('disable_rollback', True),
+            environment = kwargs.get('environment'),
+            files = kwargs.get('files'),
+            parameters = kwargs.get('parameters'),
+            timeout_mins = kwargs.get('timeout_mins')
+            return self.manager.update_launch_config(
+                self, template=template, template_url=template_url,
+                disable_rollback=disable_rollback, environment=environment,
+                files=files, parameters=parameters, timeout_mins=timeout_mins)
 
 
     def update_launch_metadata(self, metadata):
@@ -388,28 +411,31 @@ class ScalingGroupManager(BaseManager):
         """
         Returns the launch configuration for the specified scaling group.
         """
-        key_map = {
-            "OS-DCF:diskConfig": "disk_config",
-            "flavorRef": "flavor",
-            "imageRef": "image",
-        }
         uri = "/%s/%s/launch" % (self.uri_base, utils.get_id(scaling_group))
         resp, resp_body = self.api.method_get(uri)
         ret = {}
         data = resp_body.get("launchConfiguration")
         ret["type"] = data.get("type")
         args = data.get("args", {})
-        ret["load_balancers"] = args.get("loadBalancers")
-        for key, value in args.get("server", {}).items():
-            norm_key = key_map.get(key, key)
-            ret[norm_key] = value
+        if ret['type'] == 'launch_server':
+            ret["load_balancers"] = args.get("loadBalancers")
+            key_map = {
+                "OS-DCF:diskConfig": "disk_config",
+                "flavorRef": "flavor",
+                "imageRef": "image",
+            }
+            for key, value in args.get("server", {}).items():
+                norm_key = key_map.get(key, key)
+                ret[norm_key] = value
+        elif ret['type'] == 'launch_stack':
+            args.get("stack", {})
+            for key, value in args.get("stack", {}).items():
+                ret[key] = value
         return ret
 
 
     def replace_launch_config(self, scaling_group, launch_config_type,
-            server_name, image, flavor, disk_config=None, metadata=None,
-            personality=None, networks=None, load_balancers=None,
-            key_name=None, config_drive=False, user_data=None):
+                              **kwargs):
         """
         Replace an existing launch configuration. All of the attributes must be
         specified. If you wish to delete any of the optional attributes, pass
@@ -417,19 +443,14 @@ class ScalingGroupManager(BaseManager):
         """
         group_id = utils.get_id(scaling_group)
         uri = "/%s/%s/launch" % (self.uri_base, group_id)
-        body = self._create_launch_config_body(
-                launch_config_type=launch_config_type, server_name=server_name,
-                image=image, flavor=flavor, disk_config=disk_config,
-                metadata=metadata, personality=personality, networks=networks,
-                load_balancers=load_balancers, key_name=key_name,
-                config_drive=config_drive, user_data=user_data)
+
+        body = self._create_launch_config_body(launch_config_type,
+                                               **kwargs)
         resp, resp_body = self.api.method_put(uri, body=body)
 
 
-    def update_launch_config(self, scaling_group, server_name=None, image=None,
-            flavor=None, disk_config=None, metadata=None, personality=None,
-            networks=None, load_balancers=None, key_name=None, config_drive=False,
-            user_data=None):
+    def update_launch_config(self, scaling_group, launch_config_type,
+                             **kwargs):
         """
         Updates the server launch configuration for an existing scaling group.
         One or more of the available attributes can be specified.
@@ -438,48 +459,74 @@ class ScalingGroupManager(BaseManager):
         If you want to add to it, you either need to pass the complete dict of
         metadata, or call the update_launch_metadata() method.
         """
-        if not isinstance(scaling_group, ScalingGroup):
-            scaling_group = self.get(scaling_group)
         uri = "/%s/%s/launch" % (self.uri_base, scaling_group.id)
-        largs = scaling_group.launchConfiguration.get("args", {})
-        srv_args = largs.get("server", {})
-        lb_args = largs.get("loadBalancers", {})
-        flav = flavor or srv_args.get("flavorRef")
-        dconf = disk_config or srv_args.get("OS-DCF:diskConfig", "AUTO")
-        if personality is None:
-            personality = srv_args.get("personality", [])
-        cfg_drv = config_drive or srv_args.get("config_drive")
-        if user_data:
-            user_data = base64.b64encode(user_data)
-        usr_data = user_data or srv_args.get("user_data")
-        update_metadata = metadata or srv_args.get("metadata")
-        body = {"type": "launch_server",
-                "args": {
-                    "server": {
-                        "name": server_name or srv_args.get("name"),
-                        "imageRef": image or srv_args.get("imageRef"),
-                        "flavorRef": flav,
-                        "OS-DCF:diskConfig": dconf,
-                        "networks": networks or srv_args.get("networks"),
-                    },
-                    "loadBalancers": load_balancers or lb_args,
-                },
-            }
-        bas = body["args"]["server"]
-        if cfg_drv:
-            bas["config_drive"] = cfg_drv
-        if usr_data:
-            bas["user_data"] = usr_data
-        if personality:
-            bas["personality"] = self._encode_personality(personality)
-        if update_metadata:
-            bas["metadata"] = update_metadata
-        key_name = key_name or srv_args.get("key_name")
-        if key_name:
-            bas["key_name"] = key_name
-        resp, resp_body = self.api.method_put(uri, body=body)
-        return None
+        if launch_config_type == 'launch_server':
+            server_name = kwargs.get('server_name')
+            image = kwargs.get('image')
+            flavor = kwargs.get('flavor')
+            disk_config = kwargs.get('disk_config', None)
+            metadata = kwargs.get('metadata', {})
+            personality = kwargs.get('personality')
+            networks = kwargs.get('networks')
+            load_balancers = kwargs.get('load_balancers')
+            key_name = kwargs.get('key_name')
+            config_drive = kwargs.get('config_drive', False)
+            user_data = kwargs.get('user_data')
 
+            if not isinstance(scaling_group, ScalingGroup):
+                scaling_group = self.get(scaling_group)
+            largs = scaling_group.launchConfiguration.get("args", {})
+            srv_args = largs.get("server", {})
+            lb_args = largs.get("loadBalancers", {})
+            flav = flavor or srv_args.get("flavorRef")
+            dconf = disk_config or srv_args.get("OS-DCF:diskConfig", "AUTO")
+            if personality is None:
+                personality = srv_args.get("personality", [])
+            cfg_drv = config_drive or srv_args.get("config_drive")
+            if user_data:
+                user_data = base64.b64encode(user_data)
+            usr_data = user_data or srv_args.get("user_data")
+            update_metadata = metadata or srv_args.get("metadata")
+            body = {"type": "launch_server",
+                    "args": {
+                        "server": {
+                            "name": server_name or srv_args.get("name"),
+                            "imageRef": image or srv_args.get("imageRef"),
+                            "flavorRef": flav,
+                            "OS-DCF:diskConfig": dconf,
+                            "networks": networks or srv_args.get("networks"),
+                        },
+                        "loadBalancers": load_balancers or lb_args,
+                    },
+                }
+            bas = body["args"]["server"]
+            if cfg_drv:
+                bas["config_drive"] = cfg_drv
+            if usr_data:
+                bas["user_data"] = usr_data
+            if personality:
+                bas["personality"] = self._encode_personality(personality)
+            if update_metadata:
+                bas["metadata"] = update_metadata
+            key_name = key_name or srv_args.get("key_name")
+            if key_name:
+                bas["key_name"] = key_name
+
+        elif launch_config_type == 'launch_stack':
+            st_args = {
+                'template': kwargs.get('template'),
+                'template_url': kwargs.get('template_url'),
+                'disable_rollback': kwargs.get('disable_rollback', True),
+                'environment': kwargs.get('environment'),
+                'files': kwargs.get('files'),
+                'parameters': kwargs.get('parameters'),
+                'timeout_mins': kwargs.get('timeout_mins')
+            }
+            st_args = {
+                k: st_args[k] for k in st_args if st_args[k] is not None}
+            body = {"type": 'launch_stack', "args": {"stack": st_args}}
+
+        resp, resp_body = self.api.method_put(uri, body=body)
 
     def update_launch_metadata(self, scaling_group, metadata):
         """
@@ -779,34 +826,64 @@ class ScalingGroupManager(BaseManager):
                     pfile["contents"] = base64.b64encode(pfile["contents"])
         return personality
 
+    def _create_launch_config_body(self, launch_config_type, **kwargs):
+        if launch_config_type == 'launch_server':
+            server_name = kwargs.get('server_name')
+            image = kwargs.get('image')
+            flavor = kwargs.get('flavor')
+            disk_config = kwargs.get('disk_config', None)
+            metadata = kwargs.get('metadata', {})
+            personality = kwargs.get('personality')
+            networks = kwargs.get('networks')
+            load_balancers = kwargs.get('load_balancers')
+            key_name = kwargs.get('key_name')
+            config_drive = kwargs.get('config_drive', False)
+            user_data = kwargs.get('user_data')
 
-    def _create_body(self, name, cooldown, min_entities, max_entities,
-            launch_config_type, server_name, image, flavor, disk_config=None,
-            metadata=None, personality=None, networks=None,
-            load_balancers=None, scaling_policies=None, group_metadata=None,
-            key_name=None, config_drive=False, user_data=None):
-        """
-        Used to create the dict required to create any of the following:
-            A Scaling Group
-        """
-        if metadata is None:
-            metadata = {}
-        if scaling_policies is None:
-            scaling_policies = []
-        group_config = self._create_group_config_body(name, cooldown,
-                min_entities, max_entities, metadata=group_metadata)
-        launch_config = self._create_launch_config_body(launch_config_type,
+            return self._create_server_launch_config_body(
                 server_name, image, flavor, disk_config=disk_config,
                 metadata=metadata, personality=personality, networks=networks,
                 load_balancers=load_balancers, key_name=key_name,
                 config_drive=config_drive, user_data=user_data)
-        body = {
-                "groupConfiguration": group_config,
-                "launchConfiguration": launch_config,
-                "scalingPolicies": scaling_policies,
-                }
-        return body
 
+        elif launch_config_type == 'launch_stack':
+            st_args = {
+                'template': kwargs.get('template'),
+                'template_url': kwargs.get('template_url'),
+                'disable_rollback': kwargs.get('disable_rollback', True),
+                'environment': kwargs.get('environment'),
+                'files': kwargs.get('files'),
+                'parameters': kwargs.get('parameters'),
+                'timeout_mins': kwargs.get('timeout_mins')
+            }
+            st_args = {
+                k: st_args[k] for k in st_args if st_args[k] is not None}
+            return {"type": 'launch_stack', "args": {"stack": st_args}}
+
+    def _create_body(self, name, cooldown, min_entities, max_entities,
+            launch_config_type, **kwargs):
+        """
+        Used to create the dict required to create any of the following:
+            A Scaling Group
+        """
+        group_metadata = kwargs.get('group_metadata')
+        group_config = self._create_group_config_body(
+            name, cooldown, min_entities, max_entities,
+            metadata=group_metadata)
+
+        scaling_policies = kwargs.get('scaling_policies')
+        if scaling_policies is None:
+            scaling_policies = []
+
+        launch_config = self._create_launch_config_body(launch_config_type,
+                                                        **kwargs)
+
+        body = {
+            "groupConfiguration": group_config,
+            "launchConfiguration": launch_config,
+            "scalingPolicies": scaling_policies,
+        }
+        return body
 
     def _create_group_config_body(self, name, cooldown, min_entities,
             max_entities, metadata=None):
@@ -823,9 +900,8 @@ class ScalingGroupManager(BaseManager):
                 }
         return body
 
-
-    def _create_launch_config_body(self, launch_config_type,
-            server_name, image, flavor, disk_config=None, metadata=None,
+    def _create_server_launch_config_body(
+            self, server_name, image, flavor, disk_config=None, metadata=None,
             personality=None, networks=None, load_balancers=None,
             key_name=None, config_drive=False, user_data=None):
 
@@ -854,7 +930,7 @@ class ScalingGroupManager(BaseManager):
             load_balancers = []
         load_balancer_args = self._resolve_lbs(load_balancers)
 
-        return {"type": launch_config_type,
+        return {"type": 'launch_server',
                 "args": {"server": server_args,
                          "loadBalancers": load_balancer_args}}
 
@@ -1075,26 +1151,18 @@ class AutoScaleClient(BaseClient):
 
 
     def replace_launch_config(self, scaling_group, launch_config_type,
-            server_name, image, flavor, disk_config=None, metadata=None,
-            personality=None, networks=None, load_balancers=None,
-            key_name=None, config_drive=False, user_data=None):
+                              **kwargs):
         """
         Replace an existing launch configuration. All of the attributes must be
         specified. If you wish to delete any of the optional attributes, pass
         them in as None.
         """
         return self._manager.replace_launch_config(scaling_group,
-                launch_config_type, server_name, image, flavor,
-                disk_config=disk_config, metadata=metadata,
-                personality=personality, networks=networks,
-                load_balancers=load_balancers, key_name=key_name,
-                config_drive=config_drive, user_data=user_data)
+                launch_config_type, **kwargs)
 
 
-    def update_launch_config(self, scaling_group, server_name=None, image=None,
-            flavor=None, disk_config=None, metadata=None, personality=None,
-            networks=None, load_balancers=None, key_name=None, config_drive=False,
-            user_data=None):
+    def update_launch_config(self, scaling_group, launch_config_type,
+                             **kwargs):
         """
         Updates the server launch configuration for an existing scaling group.
         One or more of the available attributes can be specified.
@@ -1103,12 +1171,8 @@ class AutoScaleClient(BaseClient):
         If you want to add to it, you either need to pass the complete dict of
         metadata, or call the update_launch_metadata() method.
         """
-        return self._manager.update_launch_config(scaling_group,
-                server_name=server_name, image=image, flavor=flavor,
-                disk_config=disk_config, metadata=metadata,
-                personality=personality, networks=networks,
-                load_balancers=load_balancers, key_name=key_name,
-                config_drive=config_drive, user_data=user_data)
+        return self._manager.update_launch_config(
+            scaling_group, launch_config_type, **kwargs)
 
 
     def update_launch_metadata(self, scaling_group, metadata):
